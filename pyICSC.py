@@ -51,6 +51,10 @@ class FlowError(IntEnum):
     MISSING_ETX = 10
     MISSING_EOT = 11
 
+    # Flow errors
+    TIMEOUT = 12
+    MANY_RETRIES = 13
+
 
 class ICSC:
     class Config:
@@ -69,6 +73,13 @@ class ICSC:
         # function that is executed when a timeout occurs.
         # You can use to detect anomalies in communication
         ON_TIMEOUT_CALLBACK = None
+
+        # function that is executed when a series of erros occurs.
+        # You can use to detect anomalies in communication
+        ON_MAX_FAILED_CALLBACK = None
+
+        # Indicate the max fail count when receive a msg
+        MAX_RECEIVE_FAIL = 1
 
     def __init__(self, port, baud, station, config=Config):
         self.config = config
@@ -190,30 +201,37 @@ class ICSC:
         in_data = b''
         try:
             in_data = self.port.read_until(bytearray([EOT]))
-        except TimeoutError:
+        except timeout_decorator.timeout_decorator.TimeoutError:
             if self.config.ON_TIMEOUT_CALLBACK is not None:
                 self.config.ON_TIMEOUT_CALLBACK()
         return in_data
 
     @staticmethod
     def is_truncated_msg(in_data: bytearray, error: FlowError) -> bool:
-        return in_data.endswith(bytearray([EOT])) and error == FlowError.BAD_LEN_FIELD
+        return in_data.endswith(bytearray([EOT])) and \
+               error in [FlowError.BAD_LEN_FIELD, FlowError.TO_SHORT_MSG]
 
     def get_msg(self, in_data: bytearray) -> (FlowError, dict):
         error, msg = self.extract_fields(in_data)
-        if self.is_truncated_msg(in_data, error):
-            remaining_eot = self.read_from_serial()
-            if remaining_eot != EOT:
-                return FlowError.BAD_FORMAT, {}
-            in_data.append(EOT)  # == in_data + remaining_eot
-            return self.extract_fields(in_data)
+        while self.is_truncated_msg(in_data, error):
+            remaining = self.read_from_serial()
+            in_data += remaining  # == in_data + remaining
+            error, msg = self.extract_fields(in_data)
+            if error == FlowError.NO_ERROR or len(remaining) == 0:
+                break
         return error, msg
 
-    @timeout_decorator.timeout(5)
     def process(self) -> (FlowError, dict):
+        fail_count = 0
         while True:
             in_data = self.read_from_serial()
+            if fail_count >= self.config.MAX_RECEIVE_FAIL:
+                fail_count = 0
+                if self.config.ON_MAX_FAILED_CALLBACK is not None:
+                    self.config.ON_MAX_FAILED_CALLBACK()
+                return FlowError.TIMEOUT, {}
             if len(in_data) == 0:
+                fail_count += 1
                 continue
             error, msg = self.get_msg(in_data)
             if error != FlowError.NO_ERROR:
